@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "duckdb>=1.5.5",
     "openpyxl>=3.1.5",
     "psycopg2-binary>=2.9.13",
 ]
