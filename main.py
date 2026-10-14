@@ -10,9 +10,16 @@
   §10 orders 表补全 型号/型体/颜色/交期 (work_no 组合号拆分 + norm 归一化)
   §11 特殊订单(无主指令数量) 分单数量 + 生产累计完成日
   §11.1 特殊订单 型号/型体/颜色/交期 (交期取主指令与分单全局最晚)
-  §9  补料损耗表 按截止日汇总 超料1/2/3 + 全量汇总 超料4 (多文件取文件名日期最新)
+  §9  补料损耗表 按截止日汇总 超料1/2/3 + 全量汇总 超料4(列14 总累计)
+  §9c 当月累计(列13): 以损耗表文件名日期为基准月, 该指令基准月内金额累计
+       (多文件取文件名日期最大者为基准月; 无损耗表文件 -> 跳过本列并警告)
   §13 超料月统计: 只更新脚本自有列 1~4(按月份键), 新月份整行新增,
        全部月份按月份列升序整行重排(用户列随月份键走, 公式自动平移)
+  §14 月度补料指令表(表名=YYYYMM): **库内月份驱动**——库内出现新月份自动建表,
+       已有月度表每次同步对齐库内该月数据; 行内容**全部从 PG+DuckDB 统一推导**
+       (不拷贝指令超料); 按当月累计降序, 脚本托管列1~14
+  §15 月度表汇总: 每月 TOP5 型体超料金额+占当月总额比; 每月一块5行、块间空1行,
+       新月份末尾追加; 月份范围同 §14 驱动规则
   §5  指令超料 全表格式统一为第 3 行基准(仅修正不一致的单元格)
   §12 按 交期(列6) 从小到大排序(收尾, 已有序则跳过)
 
@@ -37,7 +44,7 @@ from copy import copy
 import openpyxl
 import psycopg2
 import duckdb
-from openpyxl.styles import Font
+from openpyxl.styles import Font, PatternFill
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter
 
@@ -46,6 +53,7 @@ DB = dict(host="localhost", port=5432, dbname="postgres",
           user="postgres", password="123456")
 
 SRC = r"E:/xiaoyao/超料记录.xlsx"
+TPL = r"E:/xiaoyao/超料记录_模板.xlsx"   # §16 空模板: SRC 丢失时自动复制重建
 SHEET = "指令超料"
 DATE_FMT = "mm-dd-yy"
 
@@ -62,8 +70,8 @@ COL_STITCH = 9   # 针车完成日
 COL_ST_OVER = 10   # 超料2
 COL_ASM = 11     # 成型完成日
 COL_ASM_OVER = 12  # 超料3
-COL_SETTLE = 13  # 最终结算日(暂无数据源)
-COL_OVER4 = 14   # 超料4 = 该指令全部补料记录金额汇总(§9b)
+COL_SETTLE = 13  # 当月累计(§9c: 基准月内累计; 基准月=损耗表文件名日期)
+COL_OVER4 = 14   # 超料4(表头实为"总累计") = 该指令全部补料记录金额汇总(§9b)
 
 MARK_NODATA = "-"  # 超料列: 源表查无此指令(无数据), 区别于 0
 
@@ -599,9 +607,12 @@ def import_loss_to_duckdb(loss_files):
         con.close()
 
 
-def step9_loss_summary(ws):
+def step9_loss_summary(ws, loss_files):
     """§9: 补料责任金额按三截止日累加 -> 超料1/2/3 (含 -/0/空 三态语义)
-       §9b: 超料4 = 该指令全部补料记录金额合计(不限截止日)
+       §9b: 超料4(列14 总累计) = 该指令全部补料记录金额合计(不限截止日)
+       §9c: 当月累计(列13) = 该指令在基准月内的金额累计
+            (基准月 = 损耗表文件名附带日期最大的月份, 2026-09-26 用户规则;
+             无损耗表文件 -> 跳过本列并警告; 基准月查无 -> '-', 有记录 -> 累计含0)
 
     数据从 loss.duckdb 读取(§9a 已入库); 参与汇总的行口径与旧版一致:
     指令號非空 + 補料日期可解析 + 補料責任金額为数值。差量写入。
@@ -668,6 +679,52 @@ def step9_loss_summary(ws):
             set_cell(ws, r, COL_OVER4, MARK_NODATA)
             n4_mark += 1
     print(f"[§9b] 超料4 全量汇总: 数值 {n4_num} | 标记'-' {n4_mark}")
+
+    # §9c: 当月累计(列13) = 该指令在基准月内的金额累计
+    # 基准月 = 损耗表文件名附带日期(YYYYMMDD)最大的月份; 无文件 -> 跳过并警告
+    if not loss_files:
+        print("[§9c] 警告: 目录无损耗表文件, 无法确定基准月, 当月累计(列13)本次跳过")
+        return
+    base_ym = max(d for d, _ in loss_files)[:6]
+    base_ym = f"{base_ym[:4]}-{base_ym[4:]}"
+    con = duckdb.connect(DUCKDB_PATH, read_only=True)
+    try:
+        month_recs = con.execute(
+            f"""SELECT instr_no, amount FROM {LOSS_TABLE}
+                WHERE strftime(loss_date, '%Y-%m') = ?""",
+            [base_ym]).fetchall()
+    finally:
+        con.close()
+    m_present = set()
+    m_total = defaultdict(float)
+    for ino, amt in month_recs:
+        k = norm(ino)
+        m_present.add(k)
+        if amt is not None:
+            m_total[k] += amt
+
+    # 本列为金额, 格式基准与列14(总累计)一致; 先修正第3行样式基准
+    # (历史遗留: 列13曾被当日期列, 基准行是 mm-dd-yy, §5 会把它传播到全列)
+    m_nf = ws.cell(3, COL_OVER4).number_format
+    base_cell = ws.cell(3, COL_SETTLE)
+    if base_cell.number_format != m_nf:
+        base_cell.number_format = m_nf
+        STATS["styles"] += 1
+
+    nm_num = nm_mark = 0
+    for r in range(2, ws.max_row + 1):
+        v = ws.cell(r, COL_INSTR).value
+        if v is None:
+            continue
+        k = norm(v)
+        if k in m_present:                       # 基准月有记录 -> 当月累计(含0)
+            set_cell(ws, r, COL_SETTLE, round(m_total[k], 2), m_nf)
+            nm_num += 1
+        else:                                    # 基准月查无 -> 标记
+            set_cell(ws, r, COL_SETTLE, MARK_NODATA)
+            nm_mark += 1
+    print(f"[§9c] 当月累计(基准月 {base_ym}): 数值 {nm_num} | 标记'-' {nm_mark}"
+          f" | 基准月总额 {sum(m_total.values()):,.2f}")
 
 
 def _style_month_row(wb, ws, r):
@@ -863,6 +920,418 @@ def step13_month_summary(wb):
           f"责任 {tot - bs:,.2f})")
 
 
+def _build_month_sheet(wb, main_ws, main_keys, comp_map, view_map, sub_qty, bare_qty,
+                       prod, loss_idx, ym, m_recs, t_total):
+    """§14 子过程: 建/刷某月(yyyy-mm)的月度指令表, 表名=YYYYMM
+
+    行内容**全部从 PG + DuckDB 统一推导**(2026-09-26 用户拍板, 不再拷贝指令超料):
+      款式: 主指令 orders 直查优先, 否则分单唯一款式(同 §11.1)
+      交期: 特殊订单=主+分单全局最晚; 普通=主指令最晚(同 §10/§11.1)
+      数量: 特殊=分单求和; 视图有→视图; 否则裸键有效数量
+      完成日: 特殊=生产累计(§11); 视图有→视图; 否则有 production+数量时按累计推
+      超料1/2/3: 同 §9 三态(全期间, 截止日=完成日)
+      当月累计=本表月份库内合计; 总累计=全量合计(均 DuckDB)
+    """
+    sheet_name = ym.replace("-", "")
+    headers = [main_ws.cell(1, c).value for c in range(1, 15)]
+    m_raw, m_present, m_total = {}, set(), defaultdict(float)
+    for ino, amt in m_recs:
+        k = norm(ino)
+        m_raw.setdefault(k, str(ino).strip())
+        m_present.add(k)
+        if amt is not None:
+            m_total[k] += amt
+
+    out, n_outside = [], 0
+    for k in m_present:
+        subs = special_subs(k, sub_qty, bare_qty)
+        direct = comp_map.get(k)
+        # 款式
+        sno = sname = col_ = None
+        if direct:
+            sno, sname, col_ = (direct[0]["sno"], direct[0]["sname"], direct[0]["col"])
+        elif subs:
+            styles = {(x["sno"], x["sname"], x["col"])
+                      for kk in subs for x in comp_map.get(kk, [])}
+            if len(styles) == 1:
+                sno, sname, col_ = styles.pop()
+        # 交期
+        if subs:
+            cfms = [x["cfm"] for kk in subs for x in comp_map.get(kk, [])
+                    if x["cfm"] is not None]
+            if direct and direct[0]["cfm"] is not None:
+                cfms.append(direct[0]["cfm"])
+        else:
+            cfms = [x["cfm"] for x in direct if x["cfm"] is not None] if direct else []
+        cfm = to_datetime(max(cfms)) if cfms else None
+        # 数量
+        v = view_map.get(k)
+        if subs:
+            qty = sum(subs.values()) or None
+        elif v and v[0] is not None:
+            qty = v[0]
+        else:
+            qty = bare_qty.get(k) or None
+        # 三完成日
+        if subs:
+            cf, sf, af = finish_dates_per_proc(prod.get(k, []), qty)
+        elif v:
+            cf, sf, af = v[1], v[2], v[3]
+        else:
+            cf, sf, af = finish_dates_per_proc(prod.get(k, []), qty)
+        cf, sf, af = (to_datetime(pdate(d)) if pdate(d) else None
+                      for d in (cf, sf, af))
+        # 超料1/2/3 (同 §9 三态)
+        rows = loss_idx.get(k)
+        def _over(cutoff):
+            if cutoff is None:
+                return None                     # 完成日空 -> 留空
+            if rows:
+                return round(sum(a for d, a in rows if d <= cutoff.date()), 2)
+            return MARK_NODATA                  # 库内查无 -> '-'
+        if k not in main_keys:
+            n_outside += 1
+        out.append([m_raw[k], sno, sname, col_, qty, cfm,
+                    cf, _over(cf), sf, _over(sf), af, _over(af),
+                    round(m_total[k], 2), round(t_total[k], 2)])
+    out.sort(key=lambda row: (-row[12], str(row[0])))
+
+    # 目标表: 不存在则按「指令超料」表头/列宽新建; 存在则校验托管边界
+    if sheet_name not in wb.sheetnames:
+        ws = wb.create_sheet(sheet_name)
+        for c in range(1, 15):
+            src_c, dst_c = main_ws.cell(1, c), ws.cell(1, c)
+            dst_c.value = src_c.value
+            dst_c.font = copy(src_c.font); dst_c.fill = copy(src_c.fill)
+            dst_c.border = copy(src_c.border); dst_c.alignment = copy(src_c.alignment)
+            dst_c.number_format = src_c.number_format
+            dst_c.protection = copy(src_c.protection)
+            L = get_column_letter(c)
+            if main_ws.column_dimensions[L].width:
+                ws.column_dimensions[L].width = main_ws.column_dimensions[L].width
+        ws.freeze_panes = "A2"
+        STATS["styles"] += 14
+        print(f"[§14] 新建月度指令表 {sheet_name}")
+    else:
+        ws = wb[sheet_name]
+        cur_headers = [ws.cell(1, c).value for c in range(1, 15)]
+        cur_headers = [str(h).strip() if isinstance(h, str) else h for h in cur_headers]
+        if cur_headers != headers or ws.max_column > 14:
+            print(f"[§14] 警告: {sheet_name} 表头与指令超料不符或存在额外列"
+                  f"(max_col={ws.max_column}), 本表为脚本托管表, 已跳过, 请人工核对")
+            return
+
+    # 差量写入: 值用 set_cell, 样式以「指令超料」第 3 行各列为基准
+    base_sigs = {c: style_sig(main_ws.cell(3, c)) for c in range(1, 15)}
+    height = main_ws.row_dimensions[3].height
+    n_val = n_style = 0
+    for i, row in enumerate(out, start=2):
+        if height is not None and ws.row_dimensions[i].height != height:
+            ws.row_dimensions[i].height = height
+            n_style += 1
+        for c in range(1, 15):
+            if set_cell(ws, i, c, row[c - 1]):
+                n_val += 1
+            cell = ws.cell(i, c)
+            if style_sig(cell) != base_sigs[c]:
+                b = main_ws.cell(3, c)
+                cell.font = copy(b.font); cell.fill = copy(b.fill)
+                cell.border = copy(b.border); cell.alignment = copy(b.alignment)
+                cell.number_format = b.number_format
+                cell.protection = copy(b.protection)
+                n_style += 1
+    # 清掉旧内容多出的行
+    n_cleared = 0
+    for r in range(2 + len(out), ws.max_row + 1):
+        for c in range(1, 15):
+            if set_cell(ws, r, c, None):
+                n_cleared += 1
+    STATS["styles"] += n_style
+    print(f"[§14] 月度指令表 {sheet_name}: {len(out)} 个指令(表外 {n_outside}), "
+          f"按当月累计降序 | 写入 {n_val} 格, 样式 {n_style} 格"
+          + (f", 清理旧行残留 {n_cleared} 格" if n_cleared else ""))
+
+
+def step14_month_detail_sheet(wb, comp_map, view, sub_qty, bare_qty, prod):
+    """§14: 月度补料指令表(表名=YYYYMM) —— 库内月份驱动, 每张表对齐库内该月数据
+
+    口径(2026-09-26 用户逐项确认 + 对齐规则 + 统一推导):
+      - **驱动**: 以 DuckDB 库内实际存在的月份为准(不看损耗表文件名)——
+          库内出现新月份(如 2026-10) -> 自动新建 202610 表;
+          已存在的月度表(YYYYMM 命名) -> 每次同步刷新, **对齐库内该月数据**;
+          依此类推(202610 也对齐, 202611 出现再新建)。
+          历史月份(功能上线前的 01~08 月)不补建, 除非用户要求。
+      - 范围: 该月有补料记录的全部指令(norm 匹配), 含「指令超料」表外指令
+      - **行内容全部从 PG + DuckDB 统一推导**(用户拍板, 不拷贝指令超料):
+          型号/型体/颜色/交期 <- orders(特殊订单走 §11.1 分单规则);
+          数量 <- 特殊分单求和 / 视图 / 裸键有效数量;
+          三完成日 <- 特殊生产累计(§11) / 视图 / production 累计;
+          超料1/2/3 <- 同 §9 三态(全期间); 当月累计=该月合计; 总累计=全量
+      - 排序: 当月累计降序(同额按指令升序)
+      - 托管边界: 只维护列 1~14; 表头与「指令超料」不符或有额外列 -> 警告跳过
+      - 幂等: 值/样式与现状一致一律不写
+      - 已有月度表的月份在库内消失(只可能人工删库) -> 不冻删, 警告并保留现状
+    """
+    con = duckdb.connect(DUCKDB_PATH, read_only=True)
+    try:
+        lib_months = [r[0] for r in con.execute(
+            f"""SELECT DISTINCT strftime(loss_date, '%Y-%m') FROM {LOSS_TABLE}
+                WHERE loss_date IS NOT NULL ORDER BY 1""").fetchall()]
+        if not lib_months:
+            print("[§14] 警告: 库内无任何损耗数据, 月度指令表跳过")
+            return
+        all_recs = con.execute(
+            f"""SELECT loss_date, instr_no, amount
+                FROM {LOSS_TABLE} WHERE loss_date IS NOT NULL""").fetchall()
+    finally:
+        con.close()
+
+    by_month = defaultdict(list)
+    t_total = defaultdict(float)
+    loss_idx = defaultdict(list)                # norm -> [(date, amt)] (同 §9)
+    for d, ino, amt in all_recs:
+        by_month[d.strftime("%Y-%m")].append((ino, amt))
+        k = norm(ino)
+        if amt is not None:
+            t_total[k] += amt
+            loss_idx[k].append((d, amt))
+
+    view_map = {norm(wno): (qty, cf, sf, af) for wno, qty, cf, sf, af in view}
+    main_ws = wb[SHEET]
+    main_keys = {norm(main_ws.cell(r, COL_INSTR).value)
+                 for r in range(2, main_ws.max_row + 1)
+                 if main_ws.cell(r, COL_INSTR).value is not None}
+
+    # 目标月份 = 库内最新月份 + 已存在月度表的月份(且库内仍有该月数据)
+    targets = {lib_months[-1]}
+    for sn in wb.sheetnames:
+        if re.fullmatch(r"\d{6}", sn):
+            ym = f"{sn[:4]}-{sn[4:]}"
+            if ym in by_month:
+                targets.add(ym)
+            else:
+                print(f"[§14] 警告: 月度表 {sn} 的月份库内已无数据(可能被人工清库), "
+                      f"表保留不删、本次不刷新, 请人工确认")
+    for ym in sorted(targets):
+        _build_month_sheet(wb, main_ws, main_keys, comp_map, view_map,
+                           sub_qty, bare_qty, prod, loss_idx,
+                           ym, by_month[ym], t_total)
+
+
+STYLE_SUM_SHEET = "月度表汇总"
+STYLE_SUM_HEADERS = ["月份", "排名", "型号", "型体", "超料金额", "月度占比"]
+STYLE_SUM_HEADERS_OLD = ["月份", "型号", "型体", "超料金额", "月度占比"]  # 无排名列的旧版
+TOP_N_STYLES = 5
+SUM_ROW_FILL = "FFF2CC"   # 合计行浅金底色(2026-09-26 用户要求: 整行加粗+浅金底)
+
+
+def _border_sig(b):
+    """边框四边线型签名(颜色忽略: 复制时随 copy 带走, 仅按线型判定是否需要写)"""
+    return tuple(getattr(b, n).style for n in ("left", "right", "top", "bottom"))
+
+
+def _sum_row_style(cell, is_sum):
+    """§15 合计行样式(差量): 合计行整行 加粗+浅金底; 非合计行仅清理脚本残留金底"""
+    fill = cell.fill
+    has_gold = (fill is not None and fill.fill_type == "solid"
+                and isinstance(fill.fgColor.rgb, str)
+                and fill.fgColor.rgb.upper().endswith(SUM_ROW_FILL))
+    if is_sum:
+        changed = False
+        if not cell.font.bold:
+            f = copy(cell.font); f.bold = True; cell.font = f
+            changed = True
+        if not has_gold:
+            cell.fill = PatternFill("solid", fgColor="FF" + SUM_ROW_FILL)
+            changed = True
+        return changed
+    if has_gold:  # 布局变动留下的脚本样式残留, 清除(不动用户手改的非金底样式)
+        cell.fill = PatternFill(fill_type=None)
+        if cell.font.bold:
+            f = copy(cell.font); f.bold = False; cell.font = f
+        return True
+    return False
+
+
+def step15_style_summary(wb, comp_map, sub_qty, bare_qty):
+    """§15: 月度表汇总 — 每月 TOP5 型体的超料金额 + 占当月总额百分比
+
+    口径(2026-09-26 用户逐项确认):
+      - 超料金额 = 该型体当月 `補料責任金額` 合计(NULL 不计); 分母 = 当月全部
+        补料总额(同 §13 超料总额口径); 占比 = 金额/当月总额, 百分比格式
+      - 月份格式 `yyyy-mm`; 型体归属与 §14 同款(主指令直查 -> 分单唯一款式,
+        查无归"未知(无款式)"); 排名=金额降序(同额按 型号/型体 升序)
+      - 布局: 每月一块 5 行 + 合计行, 块间空 1 行; **新月份在末尾空一行后追加新块**;
+        合计行(2026-09-26 用户确认)= TOP5 小计(块内 5 行纵向加总, 占比=前五占比之和),
+        "合计"写型体列, 排名/型号格留空; 整行加粗 + 浅金底 FFF2CC(2026-09-26 用户要求)
+      - 新增行格式(2026-09-26 用户规则"下一次以现在的为准"): 仅本次新写出的行,
+        行高+格线复制上一块同位置行(不足一块用首数据行); 已有行绝不动, 不纠正用户手改
+      - 月份范围: 库内最新月份 + 表内已有月份(对齐刷新); 历史月份不补建;
+        表内月份在库内消失(人工清库) -> 整表跳过并警告(绝不清行)
+      - 脚本托管表: 表头须为 月份/排名/型号/型体/超料金额/月度占比,
+        第 7 列起须无任何值(忽略仅有样式的空尾列), 否则跳过警告; 幂等差量写入
+      - 旧版 5 列(无排名列)自动迁移: 型号前插入"排名"列(2026-09-26 用户要求)
+    """
+    con = duckdb.connect(DUCKDB_PATH, read_only=True)
+    try:
+        lib_months = [r[0] for r in con.execute(
+            f"""SELECT DISTINCT strftime(loss_date, '%Y-%m') FROM {LOSS_TABLE}
+                WHERE loss_date IS NOT NULL ORDER BY 1""").fetchall()]
+        if not lib_months:
+            print("[§15] 警告: 库内无任何损耗数据, 月度表汇总跳过")
+            return
+        recs = con.execute(
+            f"""SELECT strftime(loss_date, '%Y-%m'), instr_no, amount
+                FROM {LOSS_TABLE} WHERE loss_date IS NOT NULL
+                  AND amount IS NOT NULL""").fetchall()
+    finally:
+        con.close()
+
+    def style_of(k):
+        direct = comp_map.get(k)
+        if direct:
+            return direct[0]["sno"], direct[0]["sname"]
+        subs = special_subs(k, sub_qty, bare_qty)
+        if subs:
+            styles = {(x["sno"], x["sname"]) for kk in subs
+                      for x in comp_map.get(kk, [])}
+            if len(styles) == 1:
+                return styles.pop()
+        return None, "未知(无款式)"
+
+    by_month = defaultdict(lambda: defaultdict(float))
+    month_total = defaultdict(float)
+    for ym, ino, amt in recs:
+        by_month[ym][style_of(norm(ino))] += amt
+        month_total[ym] += amt
+
+    # 目标月份 = 库内最新月份 + 表内已有月份(库内仍有数据)
+    if STYLE_SUM_SHEET in wb.sheetnames:
+        ws = wb[STYLE_SUM_SHEET]
+        cur_headers = [ws.cell(1, c).value for c in range(1, 7)]
+        cur_headers = [str(h).strip() if isinstance(h, str) else h
+                       for h in cur_headers]
+
+        def cols_empty(start_c):
+            """第 start_c 列起是否全无任何值(忽略仅有样式的空尾列)"""
+            for row in ws.iter_rows(min_col=start_c, max_col=ws.max_column):
+                if any(cell.value is not None for cell in row):
+                    return False
+            return True
+
+        # 旧版 5 列(无排名) -> 自动迁移: 在第 2 列插入"排名"(2026-09-26 用户要求)
+        if cur_headers[:5] == STYLE_SUM_HEADERS_OLD and cols_empty(6):
+            ws.insert_cols(2)
+            h = ws.cell(1, 2)
+            h.value = "排名"
+            src = ws.cell(1, 1)
+            h.font = copy(src.font); h.fill = copy(src.fill)
+            h.border = copy(src.border); h.alignment = copy(src.alignment)
+            h.number_format = src.number_format
+            if ws.column_dimensions["B"].width is None:
+                ws.column_dimensions["B"].width = 8
+            # 数据行新列补样式(与右邻型号列一致), 差量
+            for r in range(2, ws.max_row + 1):
+                dst, src2 = ws.cell(r, 2), ws.cell(r, 3)
+                if style_sig(dst) != style_sig(src2):
+                    dst.font = copy(src2.font); dst.fill = copy(src2.fill)
+                    dst.border = copy(src2.border)
+                    dst.alignment = copy(src2.alignment)
+                    dst.number_format = src2.number_format
+                    dst.protection = copy(src2.protection)
+                    STATS["styles"] += 1
+            STATS["cells"] += 1
+            print(f"[§15] {STYLE_SUM_SHEET} 结构迁移: 已在型号列前插入 排名 列")
+            cur_headers = STYLE_SUM_HEADERS
+        if cur_headers[:6] != STYLE_SUM_HEADERS or not cols_empty(7):
+            print(f"[§15] 警告: {STYLE_SUM_SHEET} 表头 {cur_headers} 不符或第 7 列起存在内容"
+                  f"(max_col={ws.max_column}), 本表为脚本托管表, 已跳过, 请人工核对")
+            return
+        sheet_months = {str(ws.cell(r, 1).value).strip()
+                        for r in range(2, ws.max_row + 1)
+                        if isinstance(ws.cell(r, 1).value, str)
+                        and YM_PAT.match(str(ws.cell(r, 1).value).strip())}
+        missing = sheet_months - set(lib_months)
+        if missing:
+            print(f"[§15] 警告: 表内月份 {sorted(missing)} 库内已无数据(可能被人工清库), "
+                  f"为保护内容整表跳过, 请人工确认")
+            return
+        targets = set(sheet_months) | {lib_months[-1]}
+    else:
+        ws = wb.create_sheet(STYLE_SUM_SHEET)
+        for c, h in enumerate(STYLE_SUM_HEADERS, start=1):
+            ws.cell(1, c).value = h
+        STATS["styles"] += 5
+        targets = {lib_months[-1]}
+        print(f"[§15] 新建 {STYLE_SUM_SHEET}")
+
+    # 布局: 月份升序, 每月 5 行 + 合计行(TOP5 小计, "合计"在型体列, 排名/型号留空), 块间空 1 行
+    # (合计行 2026-09-26 用户确认: 保留排名列; 口径=块内 5 行纵向加总, 占比=前五占比之和)
+    layout = []
+    for ym in sorted(targets):
+        tot = month_total.get(ym, 0)
+        if tot <= 0:
+            print(f"[§15] 警告: {ym} 当月总额为 0, 该月块跳过")
+            continue
+        top = sorted(by_month[ym].items(),
+                     key=lambda x: (-x[1], str(x[0][0]), str(x[0][1])))[:TOP_N_STYLES]
+        for rank, ((sno, sname), amt) in enumerate(top, start=1):
+            layout.append([ym, rank, sno, sname, round(amt, 2), amt / tot])
+        sum_amt = sum(a for _, a in top)
+        layout.append([ym, None, None, "合计", round(sum_amt, 2), sum_amt / tot])
+        layout.append(None)
+    if layout:
+        layout.pop()                # 去掉末尾多出的分隔空行
+
+    old_max_row = ws.max_row      # 写入前末行(新增行格式判定基准)
+    n_val = n_sty = 0
+    for i, row in enumerate(layout, start=2):
+        is_sum = row is not None and row[3] == "合计"
+        for c in range(1, 7):
+            v = None if row is None else row[c - 1]
+            nf = None
+            if row is not None and c == 5:
+                nf = "#,##0.00"
+            elif row is not None and c == 6:
+                nf = "0.00%"
+            if set_cell(ws, i, c, v, nf):
+                n_val += 1
+            if _sum_row_style(ws.cell(i, c), is_sum):
+                n_sty += 1
+    STATS["styles"] += n_sty
+    n_cleared = 0
+    for r in range(2 + len(layout), ws.max_row + 1):
+        for c in range(1, 7):
+            if set_cell(ws, r, c, None):
+                n_cleared += 1
+    # 新增行格式(2026-09-26 用户规则"下一次以现在的为准"):
+    # 仅本次新写出的行(行号 > old_max_row), 行高+格线复制自上方 7 行处(近似上一块同位置;
+    # 块长随型体数可变(不足 5 个型体块更短), 模板可能错行型, 但体区行高/格线统一故无碍;
+    # 不足一块回落首数据行行2); 已有行绝不动, 不纠正用户手改
+    n_fmt = 0
+    for r in range(old_max_row + 1, 2 + len(layout)):
+        tmpl = r - 7 if r - 7 >= 2 else 2
+        if tmpl == r:
+            continue
+        th = ws.row_dimensions[tmpl].height
+        if th is not None and ws.row_dimensions[r].height != th:
+            ws.row_dimensions[r].height = th
+            n_fmt += 1
+        for c in range(1, 7):
+            src_b = ws.cell(tmpl, c).border
+            dst = ws.cell(r, c)
+            if _border_sig(dst.border) != _border_sig(src_b):
+                dst.border = copy(src_b)
+                n_fmt += 1
+    STATS["styles"] += n_fmt
+    months_done = sorted({row[0] for row in layout if row})
+    print(f"[§15] 月度表汇总: {len(months_done)} 个月份块({', '.join(months_done)}) "
+          f"各 TOP{TOP_N_STYLES}+合计 | 写入 {n_val} 格"
+          + (f", 合计行样式 {n_sty} 格" if n_sty else "")
+          + (f", 新增行格式 {n_fmt} 处" if n_fmt else "")
+          + (f", 清理残留 {n_cleared} 格" if n_cleared else ""))
+
+
 def step5_unify_style(ws):
     """§5: 全部数据行统一为第 3 行原始样式(用户否决第 2 行); 差量: 仅修正不一致单元格"""
     base_cells = {}
@@ -945,10 +1414,49 @@ def verify(ws):
     return n_rows, sort_viol, mono_viol
 
 
+def make_template():
+    """§16: 由当前工作文件生成空模板(结构/格式骨架, 不含业务数据)
+
+    保留: 指令超料 表头+行2/3(清空值留样式; §4 从行2起追加, §5 以行3为样式基准);
+          月度表汇总 表头+行2(清值留样式, 作 §15 新增行格式种子)
+    移除: 超料月统计 与所有月度指令表(§13/§14 同步时从零重建, 含样式)
+    不含: 超料月统计 E/F 手工列等一切用户手工数据(2026-09-26 用户拍板空模板方案)
+    用法: uv run python main.py --make-template  (结构大改后重新生成)
+    """
+    if not os.path.exists(SRC):
+        sys.exit(f"工作文件不存在, 无法生成模板: {SRC}")
+    wb = openpyxl.load_workbook(SRC)
+    ws = wb[SHEET]
+    if ws.max_row > 3:
+        ws.delete_rows(4, ws.max_row - 3)
+    for r in (2, 3):
+        for c in range(1, ws.max_column + 1):
+            ws.cell(r, c).value = None
+    if STYLE_SUM_SHEET in wb.sheetnames:
+        ws2 = wb[STYLE_SUM_SHEET]
+        if ws2.max_row > 2:
+            ws2.delete_rows(3, ws2.max_row - 2)
+        for c in range(1, ws2.max_column + 1):
+            ws2.cell(2, c).value = None
+    for sn in list(wb.sheetnames):
+        if sn == MONTH_SHEET or re.fullmatch(r"\d{6}", sn):
+            del wb[sn]
+    wb.save(TPL)
+    print(f"[模板] 已生成 {TPL}")
+    print(f"[模板] 保留: {SHEET}(表头+行2/3样式行), {STYLE_SUM_SHEET}(表头+行2样式行)")
+    print(f"[模板] 移除: {MONTH_SHEET} 与月度指令表(同步时从零重建); 不含任何手工数据")
+
+
 def main():
     t0 = time.time()
     if not os.path.exists(SRC):
-        sys.exit(f"目标文件不存在: {SRC}")
+        if os.path.exists(TPL):
+            shutil.copy2(TPL, SRC)          # §16: 模板自动重建
+            print(f"[恢复] 目标文件不存在, 已由模板复制重建: {TPL} -> {SRC}")
+            print(f"[恢复] 脚本托管数据本次同步自动重建; 注意: {MONTH_SHEET} E/F 手工列"
+                  f"(生产数量/平均单价)模板不含, 如有时间戳备份请找回补填")
+        else:
+            sys.exit(f"目标文件不存在: {SRC} (模板 {TPL} 也不存在, 请从时间戳备份恢复)")
     loss_files = list_loss_files()
     import_loss_to_duckdb(loss_files)   # §9a: 记录级 upsert 入库(只增不删, md5 幂等)
     view, comp_map, sub_qty, bare_qty, prod = fetch_pg_data()
@@ -959,8 +1467,10 @@ def main():
     step4_sync_view(ws, view)
     step10_orders_fill(ws, comp_map, sub_qty, bare_qty)
     step11_special_orders(ws, comp_map, sub_qty, bare_qty, prod)
-    step9_loss_summary(ws)
+    step9_loss_summary(ws, loss_files)
     step13_month_summary(wb)
+    step14_month_detail_sheet(wb, comp_map, view, sub_qty, bare_qty, prod)
+    step15_style_summary(wb, comp_map, sub_qty, bare_qty)
     step5_unify_style(ws)
     step12_sort_by_cfm(ws)
 
@@ -981,4 +1491,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if "--make-template" in sys.argv:   # §16: 重新生成空模板
+        make_template()
+    else:
+        main()
